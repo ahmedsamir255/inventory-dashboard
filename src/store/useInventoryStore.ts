@@ -11,6 +11,7 @@ interface InventoryState {
   schedules: InventorySchedule[]
   inv2025: Inventory2025[]
   inv2026Items: Inv2026Item[]
+  _loaded: boolean
   _push: () => void
   loadFromServer: () => Promise<void>
   fetchBranches: () => Promise<void>
@@ -36,8 +37,10 @@ export const useInventoryStore = create<InventoryState>()((set, get) => ({
   branches: [], products: [], stocks: [], transfers: [],
   stockTakes: [], audits: [], damages: [], sales: [], users: [], schedules: [], inv2025: [],
       inv2026Items: [],
+  _loaded: false,
 
   _push: () => {
+    if (!get()._loaded) return
     const s = get()
     fetchState().then(remote => {
       pushState({ ...remote, ...getInventoryState(s) })
@@ -61,6 +64,8 @@ export const useInventoryStore = create<InventoryState>()((set, get) => ({
         users:      data.users      ?? [],
         schedules:  data.schedules  ?? [],
         inv2025:    data.inv2025    ?? [],
+        inv2026Items: data.inv2026Items ?? [],
+        _loaded: true,
       })
     } catch (e) { console.warn('loadFromServer failed', e) }
   },

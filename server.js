@@ -809,8 +809,8 @@ app.post('/api/import/inv2025-excel', upload.single('file'), (req, res) => {
     
     const workbook = XLSX.readFile(req.file.path)
     const sheet = workbook.Sheets[workbook.SheetNames[0]]
-    const rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false })
-    
+    const rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: true })
+
     console.log(`[Import 2025] Read ${rows.length} rows`)
     console.log('[Import 2025] Columns:', rows.length > 0 ? Object.keys(rows[0]) : 'none')
     
@@ -829,9 +829,11 @@ app.post('/api/import/inv2025-excel', upload.single('file'), (req, res) => {
     
     let added = 0
     
+    const insertBranch = db.prepare(`INSERT INTO branches (id,name,branchCode,branchType,area,areaManager,mobile,workingHours,location,branchClass,manager,country,email,notes,lastInventory,inventoryValue,stockValue,managerId,deputyId,status,createdAt) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+
     for (const row of rows) {
       const keys = Object.keys(row)
-      
+
       // Find branch code/name
       let code = '', name = ''
       for (const key of keys) {
@@ -839,14 +841,19 @@ app.post('/api/import/inv2025-excel', upload.single('file'), (req, res) => {
         if (lower.includes('code') || lower === 'b.code' || lower === 'bcode') code = String(row[key] || '').trim()
         if (lower.includes('name') || lower.includes('branch')) name = String(row[key] || '').trim()
       }
-      
+
       if (!code && !name) continue
-      
-      // Find branch in database
-      const branch = db.prepare('SELECT id FROM branches WHERE branchCode = ? OR name = ?').get(code, name)
+
+      // Skip the "Grand Total" summary row
+      if (code.toLowerCase() === 'grand total' || name.toLowerCase() === 'grand total') continue
+
+      // Find branch in database, or auto-create if missing
+      let branch = db.prepare('SELECT id FROM branches WHERE branchCode = ? OR name = ?').get(code, name)
       if (!branch) {
-        console.log(`[Import 2025] Branch not found: ${code || name}`)
-        continue
+        const newId = uid2()
+        insertBranch.run(newId, name || code, code || '', 'Branch', '', '', '', '', '', 'A', '', '', '', '[auto-created from import]', '', 0, 0, '', '', 'Active', new Date().toISOString().slice(0,10))
+        branch = { id: newId }
+        console.log(`[Import 2025] Auto-created branch: ${code || name}`)
       }
       
       // Read months

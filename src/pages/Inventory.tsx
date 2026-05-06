@@ -842,7 +842,7 @@ export default function Inventory() {
               </tbody>
               <tfoot className="bg-gray-100 font-bold">
                 <tr>
-                  <td colSpan={3} className="px-3 py-2 text-right">TOTAL</td>
+                  <td colSpan={2} className="px-3 py-2 text-right">TOTAL</td>
                   {(['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'] as const).map(m => {
                     const total = inv2025.reduce((sum, i) => sum + (Number(i.months[m]) || 0), 0)
                     return (
