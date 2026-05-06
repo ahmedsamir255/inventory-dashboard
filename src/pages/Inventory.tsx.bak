@@ -1,0 +1,897 @@
+import { useState, useRef, useMemo } from 'react'
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, ReferenceLine } from 'recharts'
+import * as XLSX from 'xlsx'
+import { exportToExcel } from '../utils/exportExcel'
+import { useInventoryStore } from '../store/useInventoryStore'
+import type { Transfer, InventorySchedule, InventoryType, Inventory2025 } from '../types'
+import { INVENTORY_TYPES } from '../types'
+
+const DAYS = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday']
+function getDayName(d: string) { if (!d) return ''; const dt = new Date(d); return isNaN(dt.getTime())?'':DAYS[dt.getDay()] }
+function getDaysDiff(from: string, to: string) { if (!from||!to) return 0; return Math.abs(Math.round((new Date(to).getTime()-new Date(from).getTime())/86400000)) }
+
+const TYPE_COLORS: Record<InventoryType,string> = {
+  'Full Count':'bg-blue-50','Cycle Count':'bg-green-50',
+  'Batches':'bg-purple-50','Branch Hand Over':'bg-orange-50',
+}
+const EMPTY: Omit<InventorySchedule,'id'> = { inventoryType:'Full Count',from:'',to:'',branchId:'',region:'',team:'',inOut:'IN',results:0,totalSales2026:0,lastInventoryResult:0,lastInventory:'',teamLeader:'',notes:'' }
+const EMPTY25: Omit<Inventory2025,'id'> = { inventoryType:'Full Count',date:'',area:'',branchId:'',branchCode:'',results:0,sales:0,notes:'' }
+
+export default function Inventory() {
+  const { branches,products,stocks,transferStock,schedules,addSchedule,updateSchedule,deleteSchedule,inv2025,addInv2025,updateInv2025,inv2026Items,bulkAddInv2026Items,deleteInv2026ItemsByBranch } = useInventoryStore()
+  const [tab,setTab] = useState<'stock'|'schedule'|'inv2025'|'inv2026'|'analysis'>('stock')
+  const [branchFilter,setBranchFilter] = useState('all')
+  const [selectedBranch25,setSelectedBranch25] = useState<string|null>(null)
+  const [selectedBranch26,setSelectedBranch26] = useState<string|null>(null)
+  const [showTransfer,setShowTransfer] = useState(false)
+  const [showAdd26Modal,setShowAdd26Modal] = useState(false)
+  const [add26Form,setAdd26Form] = useState({inventoryType:'Full Count' as InventoryType, date:'', area:'', branchId:'', notes:'', file:null as File|null})
+  const add26FileRef = useRef<HTMLInputElement>(null)
+  const [tf,setTf] = useState<Omit<Transfer,'id'>>({fromBranchId:'',toBranchId:'',productId:'',quantity:1,date:new Date().toISOString().slice(0,10),note:''})
+
+  // Schedule modal
+  const [showModal,setShowModal] = useState(false)
+  const [editRec,setEditRec] = useState<InventorySchedule|null>(null)
+  const [form,setForm] = useState<Omit<InventorySchedule,'id'>>(EMPTY)
+
+  // Inv2025 modal
+  const [showI25Modal,setShowI25Modal] = useState(false)
+  const [editI25,setEditI25] = useState<Inventory2025|null>(null)
+  const [form25,setForm25] = useState<Omit<Inventory2025,'id'>>(EMPTY25)
+
+  const rows = stocks.filter(s=>branchFilter==='all'||s.branchId===branchFilter).map(s=>({...s,branch:branches.find(b=>b.id===s.branchId),product:products.find(p=>p.id===s.productId)})).filter(r=>r.branch&&r.product)
+  const doExport = () => exportToExcel(rows.map(r=>({Branch:r.branch?.name,SKU:r.product?.sku,Description:r.product?.description,Quantity:r.quantity,'Unit Cost':r.product?.unitCost,'Sales Price':r.product?.salesPrice,'Last Updated':r.lastUpdated})),'Inventory')
+  const doTransfer = () => { if(!tf.fromBranchId||!tf.toBranchId||!tf.productId||tf.quantity<1)return; transferStock(tf);setShowTransfer(false) }
+  const getQty = (bid:string,pid:string) => stocks.find(s=>s.branchId===bid&&s.productId===pid)?.quantity??0
+
+  // Schedule actions
+  const openAdd = () => { setEditRec(null);setForm(EMPTY);setShowModal(true) }
+  const openEdit = (s:InventorySchedule) => { setEditRec(s);setForm({inventoryType:s.inventoryType,from:s.from,to:s.to,branchId:s.branchId,region:s.region,team:s.team,inOut:s.inOut,results:s.results,totalSales2026:s.totalSales2026,lastInventoryResult:s.lastInventoryResult,lastInventory:s.lastInventory,teamLeader:s.teamLeader,notes:s.notes});setShowModal(true) }
+  const save = () => { if(editRec)updateSchedule({...form,id:editRec.id});else addSchedule(form);setShowModal(false) }
+
+  // Inv2025 actions
+  const openAddI25 = () => { setEditI25(null);setForm25(EMPTY25);setShowI25Modal(true) }
+  // (r:Inventory2025) => { setEditI25(r);setForm25({inventoryType:r.inventoryType,date:r.date,area:r.area,branchId:r.branchId,branchCode:r.branchCode,results:r.results,sales:r.sales,notes:r.notes});setShowI25Modal(true) }
+  const saveI25 = () => { if(editI25)updateInv2025({...form25,id:editI25.id});else addInv2025(form25);setShowI25Modal(false) }
+
+  // Import Excel for schedule
+  const fileRef = useRef<HTMLInputElement>(null)
+  const fileRef25 = useRef<HTMLInputElement>(null)
+  const importRef26 = useRef<HTMLInputElement>(null)
+  const importExcel = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]; if (!file) return
+    const reader = new FileReader()
+    reader.onload = (ev) => {
+      const wb = XLSX.read(new Uint8Array(ev.target?.result as ArrayBuffer), { type: 'array', cellDates: true })
+      const rows2: Record<string,unknown>[] = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' })
+      const typeMap: Record<string,string> = { 'full count':'Full Count','cycle count':'Cycle Count','batches':'Batches','branch hand over':'Branch Hand Over' }
+      rows2.forEach(row => {
+        const fmt = (v: unknown) => { if (!v) return ''; if (v instanceof Date) return v.toISOString().slice(0,10); return String(v) }
+        const rawType = fmt(row['Inventory Type'] ?? row['Type'] ?? '').toLowerCase()
+        const invType = (typeMap[rawType] ?? 'Full Count') as InventoryType
+        const branchName = fmt(row['Branch'] ?? '')
+        const branchId = branches.find(b => b.name.toLowerCase() === branchName.toLowerCase())?.id ?? ''
+        addSchedule({ inventoryType:invType, from:fmt(row['From']??''), to:fmt(row['To']??''), branchId, branchName, region:fmt(row['Region']??''), team:fmt(row['Team']??''), inOut:fmt(row['IN/OUT']??'IN')==='OUT'?'OUT':'IN', results:Number(row['Results']??0), totalSales2026:Number(row['Total Sales 2026']??0), lastInventoryResult:Number(row['Last Inventory Result']??0), lastInventory:fmt(row['Last Inventory']??''), teamLeader:fmt(row['Team Leader']??''), notes:fmt(row['Notes']??'') })
+      })
+      e.target.value = ''
+      alert(`Imported ${rows2.length} records!`)
+    }
+    reader.readAsArrayBuffer(file)
+  }
+
+  const exportSched = () => exportToExcel(schedules.map(s=>({'Inventory Type':s.inventoryType,From:s.from,'From Day':getDayName(s.from),To:s.to,'To Day':getDayName(s.to),'No of Days':getDaysDiff(s.from,s.to),Branch:branches.find(b=>b.id===s.branchId)?.name??'',Region:s.region,Team:s.team,'IN/OUT':s.inOut,Results:s.results,'Total Sales 2026':s.totalSales2026,'Percentage %':s.totalSales2026?((s.results/s.totalSales2026)*100).toFixed(1)+'%':'','Last Inventory Result':s.lastInventoryResult,'Last Inventory':s.lastInventory,'Team Leader':s.teamLeader,Notes:s.notes})),'Inventory Schedule')
+
+  const importExcelI25 = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]; if (!file) return
+    const reader = new FileReader()
+    reader.onload = (ev) => {
+      const wb = XLSX.read(new Uint8Array(ev.target?.result as ArrayBuffer), { type: 'array', cellDates: true })
+      const rows2: Record<string,unknown>[] = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' })
+      const typeMap: Record<string,string> = { 'full count':'Full Count','cycle count':'Cycle Count','batches':'Batches','branch hand over':'Branch Hand Over' }
+      const fmt = (v: unknown) => { if (!v) return ''; if (v instanceof Date) return v.toISOString().slice(0,10); return String(v) }
+      rows2.forEach(row => {
+        const rawType = fmt(row['Inventory Type'] ?? row['Type'] ?? '').toLowerCase()
+        const invType = (typeMap[rawType] ?? 'Full Count') as InventoryType
+        const branchName = fmt(row['Branch'] ?? '')
+        const branchId = branches.find(b => b.name.toLowerCase() === branchName.toLowerCase())?.id ?? ''
+        addInv2025({ inventoryType:invType, date:fmt(row['Date']??''), area:fmt(row['Area']??''), branchId, branchCode:fmt(row['Branch Code']??row['Code']??''), results:Number(row['Results']??0), sales:Number(row['Sales']??0), notes:fmt(row['Notes']??'') })
+      })
+      e.target.value = ''
+      alert(`Imported ${rows2.length} records!`)
+    }
+    reader.readAsArrayBuffer(file)
+  }
+  const exportI25 = () => exportToExcel(inv2025.map(r=>({'Inventory Type':r.inventoryType,Date:r.date,Day:getDayName(r.date),Area:r.area,Branch:branches.find(b=>b.id===r.branchId)?.name??'','Branch Code':r.branchCode,Results:r.results,Sales:r.sales,'%':r.sales?((r.results/r.sales)*100).toFixed(1)+'%':'',Notes:r.notes})),'Inventory2025')
+
+  // Analysis data
+  const analysisData = useMemo(()=>schedules.map(s=>{
+    const branch = branches.find(b=>b.id===s.branchId)
+    const days = Math.abs(Math.round((new Date(s.to).getTime()-new Date(s.from).getTime())/86400000))
+    const daysSinceLast = s.lastInventory ? Math.abs(Math.round((new Date(s.from).getTime()-new Date(s.lastInventory).getTime())/86400000)) : null
+    const pct = s.totalSales2026 ? ((s.results/s.totalSales2026)*100) : null
+    const lastPct = s.totalSales2026 && s.lastInventoryResult ? ((s.lastInventoryResult/s.totalSales2026)*100) : null
+    return { id:s.id, branch:(branch?.name ?? s.branchName ?? '-'), region:s.region, from:s.from, to:s.to, days, lastInventory:s.lastInventory, daysSinceLast, results:s.results, totalSales:s.totalSales2026, pct, lastResults:s.lastInventoryResult, lastPct, inventoryType:s.inventoryType }
+  }).filter(r=>r.branch!=='-'),[schedules,branches])
+
+  const shortType = (t:string) => t.replace('Inventory','').replace('Count','Cnt').replace('Hand Over','H/O').trim()
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <h1 className="text-2xl font-bold text-gray-800">Inventory</h1>
+        <div className="flex gap-3 flex-wrap">
+          {tab==='stock'&&<>
+            <select className="border rounded-lg px-3 py-2 text-sm" value={branchFilter} onChange={e=>setBranchFilter(e.target.value)}>
+              <option value="all">All Branches</option>{branches.map(b=><option key={b.id} value={b.id}>{b.name}</option>)}
+            </select>
+            <button onClick={doExport} className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700">Export Excel</button>
+            <button onClick={()=>setShowTransfer(true)} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700">Transfer Stock</button>
+          </>}
+          {tab==='schedule'&&<>
+            <button onClick={exportSched} className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700">Export Excel</button>
+            <button onClick={()=>fileRef.current?.click()} className="px-4 py-2 bg-yellow-600 text-white rounded-lg text-sm font-medium hover:bg-yellow-700">Import Excel</button>
+            <input ref={fileRef} type="file" accept=".xlsx,.xls" className="hidden" onChange={importExcel}/>
+            <button onClick={openAdd} className="px-4 py-2 bg-red-700 text-white rounded-lg text-sm font-medium hover:bg-red-800">+ Add Record</button>
+          </>}
+          {(tab==='inv2025'||tab==='inv2026')&&<>
+            <button onClick={exportI25} className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700">Export Excel</button>
+            <button onClick={()=>fileRef25.current?.click()} className="px-4 py-2 bg-yellow-600 text-white rounded-lg text-sm font-medium hover:bg-yellow-700">Import Excel</button>
+            <input ref={fileRef25} type="file" accept=".xlsx,.xls" className="hidden" onChange={importExcelI25}/>
+            <button onClick={openAddI25} className="px-4 py-2 bg-red-700 text-white rounded-lg text-sm font-medium hover:bg-red-800">+ Add Record</button>
+          </>}
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div className="flex border-b border-gray-200 gap-1">
+        {(['stock','schedule','inv2025','inv2026','analysis'] as const).map(t=>(
+          <button key={t} onClick={()=>setTab(t)} className={`px-5 py-2.5 text-sm font-semibold rounded-t-lg transition-colors ${tab===t?'bg-white border border-b-white border-gray-200 text-red-700':'text-gray-500 hover:text-gray-700'}`}>
+            {t==='stock'?'Stock Value':t==='schedule'?'Inventory Schedule 2026':t==='inv2025'?'Inventory Results 2025':t==='inv2026'?'Inventory Results 2026':'Analysis'}
+          </button>
+        ))}
+      </div>
+
+      {/* â”€â”€ Inventory 2025 Tab â”€â”€ */}
+      {tab==='inv2025'&&(
+        <div className="space-y-4">
+          {/* Branch selector */}
+          {!selectedBranch25 ? (
+            <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-auto">
+              <div className="px-4 py-3 border-b bg-gray-50 flex items-center justify-between">
+                <h2 className="font-semibold text-gray-700 text-sm">Inventory Results 2025 — All Branches</h2>
+                <span className="text-xs text-gray-400">{branches.length} branches</span>
+              </div>
+              <table className="w-full" style={{fontSize:'11px'}}>
+                <thead className="bg-gray-50 border-b sticky top-0">
+                  <tr>
+                    <th className="px-3 py-2 text-left text-xs font-semibold text-gray-500 whitespace-nowrap sticky left-0 bg-gray-50">Branch</th>
+                    {['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'].map(m=>(
+                      <th key={m} className="px-2 py-2 text-center text-xs font-semibold text-gray-500">{m}</th>
+                    ))}
+                    <th className="px-3 py-2 text-center text-xs font-semibold text-red-700 bg-red-50">Total</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {branches.map((b,bi) => {
+                    const months = ['01','02','03','04','05','06','07','08','09','10','11','12']
+                    const monthlyResults = months.map(m => {
+                      const recs = inv2025.filter(r => r.branchId===b.id && r.date && r.date.startsWith('2025-'+m))
+                      return recs.reduce((s,r)=>s+(r.results??0),0)
+                    })
+                    const total = monthlyResults.reduce((s,v)=>s+v,0)
+                    return (
+                      <tr key={b.id} className={`cursor-pointer hover:bg-red-50 transition-colors ${bi%2===0?'bg-white':'bg-gray-50/40'}`}
+                          onClick={()=>setSelectedBranch25(b.id)}>
+                        <td className="px-3 py-1.5 font-medium text-gray-800 whitespace-nowrap sticky left-0 bg-inherit">
+                          <span className="text-xs text-gray-400 mr-1">{b.branchCode}</span>{b.name}
+                        </td>
+                        {monthlyResults.map((v,i)=>(
+                          <td key={i} className={`px-2 py-1.5 text-center font-semibold ${v<0?'text-red-600 bg-red-50':v>0?'text-green-700':'text-gray-300'}`}>
+                            {v!==0?v.toLocaleString('en-US'):'—'}
+                          </td>
+                        ))}
+                        <td className={`px-3 py-1.5 text-center font-bold ${total<0?'text-red-700 bg-red-100':total>0?'text-green-700 bg-green-100':'text-gray-400 bg-gray-100'}`}>
+                          {total!==0?total.toLocaleString('en-US'):'—'}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                  {/* Total row */}
+                  {(() => {
+                    const months = ['01','02','03','04','05','06','07','08','09','10','11','12']
+                    const grandMonthly = months.map(m => inv2025.filter(r=>r.date&&r.date.startsWith('2025-'+m)).reduce((s,r)=>s+(r.results??0),0))
+                    const grandTotal = grandMonthly.reduce((s,v)=>s+v,0)
+                    return (
+                      <tr className="bg-red-700 text-white font-bold">
+                        <td className="px-3 py-2 sticky left-0 bg-red-700">Grand Total</td>
+                        {grandMonthly.map((v,i)=>(
+                          <td key={i} className="px-2 py-2 text-center">{v!==0?v.toLocaleString('en-US'):'—'}</td>
+                        ))}
+                        <td className="px-3 py-2 text-center">{grandTotal.toLocaleString('en-US')}</td>
+                      </tr>
+                    )
+                  })()}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            /* Branch drill-down */
+            <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-auto">
+              <div className="px-4 py-3 border-b bg-gray-50 flex items-center gap-3">
+                <button onClick={()=>setSelectedBranch25(null)} className="text-xs text-red-600 hover:underline font-medium">← All Branches</button>
+                <h2 className="font-semibold text-gray-700 text-sm">
+                  {branches.find(b=>b.id===selectedBranch25)?.name} — Inventory Results 2025
+                </h2>
+              </div>
+              <table className="w-full text-sm">
+                <thead className="bg-gray-50 border-b">
+                  <tr>{['Date','Day','Type','Area','Branch Code','Results','Sales','%','Notes'].map(h=>(
+                    <th key={h} className="px-3 py-2 text-left text-xs font-semibold text-gray-500">{h}</th>
+                  ))}</tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {inv2025.filter(r=>r.branchId===selectedBranch25).map(r=>{
+                    const pct = r.sales?(r.results/r.sales*100).toFixed(1)+'%':'—'
+                    return (
+                      <tr key={r.id} className="hover:bg-gray-50">
+                        <td className="px-3 py-2 whitespace-nowrap">{r.date}</td>
+                        <td className="px-3 py-2 text-gray-400">{getDayName(r.date).slice(0,3)}</td>
+                        <td className="px-3 py-2"><span className={`px-2 py-0.5 rounded-full text-xs font-medium ${TYPE_COLORS[r.inventoryType]??''}`}>{r.inventoryType}</span></td>
+                        <td className="px-3 py-2">{r.area}</td>
+                        <td className="px-3 py-2 font-mono text-xs text-blue-600">{r.branchCode}</td>
+                        <td className={`px-3 py-2 font-bold ${(r.results??0)<0?'text-red-600':'text-green-700'}`}>{(r.results??0).toLocaleString('en-US')}</td>
+                        <td className="px-3 py-2">{(r.sales??0).toLocaleString('en-US')}</td>
+                        <td className="px-3 py-2 font-semibold">{pct}</td>
+                        <td className="px-3 py-2 text-gray-400 text-xs">{r.notes}</td>
+                      </tr>
+                    )
+                  })}
+                  {inv2025.filter(r=>r.branchId===selectedBranch25).length===0&&(
+                    <tr><td colSpan={9} className="px-4 py-8 text-center text-gray-400">No records for this branch</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* â”€â”€ Inventory Schedule Tab â”€â”€ */}
+      {tab==='schedule'&&(
+        <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-x-auto">
+          <div className="flex flex-wrap gap-2 px-4 pt-3 pb-2">
+            {INVENTORY_TYPES.map(t=><span key={t} className={`px-3 py-1 rounded-full text-xs font-medium border border-gray-200 ${TYPE_COLORS[t]}`}>{t}</span>)}
+          </div>
+          <table className="w-full" style={{fontSize:'9px'}}>
+            <thead className="bg-gray-50 border-b border-t">
+              <tr>
+                <th className="px-1 py-1.5 text-left font-semibold text-gray-500 uppercase" style={{minWidth:'70px'}}>Type</th>
+                <th className="px-1 py-1.5 text-left font-semibold text-gray-500 uppercase" style={{minWidth:'68px'}}>From</th>
+                <th className="px-1 py-1.5 text-left font-semibold text-gray-500 uppercase" style={{minWidth:'55px'}}>Day</th>
+                <th className="px-1 py-1.5 text-left font-semibold text-gray-500 uppercase" style={{minWidth:'68px'}}>To</th>
+                <th className="px-1 py-1.5 text-left font-semibold text-gray-500 uppercase" style={{minWidth:'55px'}}>Day</th>
+                <th className="px-1 py-1.5 text-center font-semibold text-gray-500 uppercase" style={{minWidth:'22px'}}>D</th>
+                <th className="px-1 py-1.5 text-left font-semibold text-gray-500 uppercase" style={{minWidth:'70px'}}>Branch</th>
+                <th className="px-1 py-1.5 text-left font-semibold text-gray-500 uppercase" style={{minWidth:'50px'}}>Region</th>
+                <th className="px-1 py-1.5 text-left font-semibold text-gray-500 uppercase" style={{minWidth:'50px'}}>Team</th>
+                <th className="px-1 py-1.5 text-left font-semibold text-gray-500 uppercase" style={{minWidth:'28px'}}>I/O</th>
+                <th className="px-1 py-1.5 text-right font-semibold text-gray-500 uppercase" style={{minWidth:'55px'}}>Results</th>
+                <th className="px-1 py-1.5 text-right font-semibold text-gray-500 uppercase" style={{minWidth:'55px'}}>Sales</th>
+                <th className="px-1 py-1.5 text-right font-semibold text-gray-500 uppercase" style={{minWidth:'30px'}}>%</th>
+                <th className="px-1 py-1.5 text-right font-semibold text-gray-500 uppercase" style={{minWidth:'50px'}}>L.Res</th>
+                <th className="px-1 py-1.5 text-left font-semibold text-gray-500 uppercase" style={{minWidth:'65px'}}>L.Inv</th>
+                <th className="px-1 py-1.5 text-left font-semibold text-gray-500 uppercase" style={{minWidth:'55px'}}>Leader</th>
+                <th className="px-1 py-1.5 text-left font-semibold text-gray-500 uppercase" style={{minWidth:'50px'}}>Notes</th>
+                <th className="px-1 py-1.5" style={{minWidth:'50px'}}></th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {schedules.length===0&&<tr><td colSpan={18} className="px-4 py-8 text-center text-gray-400">No records â€” click "+ Add Record"</td></tr>}
+              {schedules.map(s=>{
+                const branch=branches.find(b=>b.id===s.branchId)
+                const pct=s.totalSales2026?((s.results/s.totalSales2026)*100).toFixed(1)+'%':'â€”'
+                return(
+                  <tr key={s.id} className={`${TYPE_COLORS[s.inventoryType]} hover:brightness-95`}>
+                    <td className="px-1 py-1 font-semibold whitespace-nowrap">{shortType(s.inventoryType)}</td>
+                    <td className="px-1 py-1 whitespace-nowrap">{s.from}</td>
+                    <td className="px-1 py-1 text-gray-400">{getDayName(s.from).slice(0,3)}</td>
+                    <td className="px-1 py-1 whitespace-nowrap">{s.to}</td>
+                    <td className="px-1 py-1 text-gray-400">{getDayName(s.to).slice(0,3)}</td>
+                    <td className="px-1 py-1 font-semibold text-center">{getDaysDiff(s.from,s.to)}</td>
+                    <td className="px-1 py-1 whitespace-nowrap">{(branch?.name ?? s.branchName ?? '-')}</td>
+                    <td className="px-1 py-1">{s.region}</td>
+                    <td className="px-1 py-1">{s.team}</td>
+                    <td className="px-1 py-1"><span className={`px-1 py-0.5 rounded font-bold ${s.inOut==='IN'?'bg-green-100 text-green-700':'bg-red-100 text-red-700'}`}>{s.inOut}</span></td>
+                    <td className="px-1 py-1 text-right font-semibold">{s.results.toLocaleString()}</td>
+                    <td className="px-1 py-1 text-right">{s.totalSales2026.toLocaleString()}</td>
+                    <td className="px-1 py-1 text-right font-semibold">{pct}</td>
+                    <td className="px-1 py-1 text-right">{s.lastInventoryResult.toLocaleString()}</td>
+                    <td className="px-1 py-1 whitespace-nowrap">{s.lastInventory}</td>
+                    <td className="px-1 py-1">{s.teamLeader}</td>
+                    <td className="px-1 py-1 text-gray-400 max-w-[60px] truncate">{s.notes}</td>
+                    <td className="px-1 py-1 whitespace-nowrap">
+                      <button onClick={()=>openEdit(s)} className="text-blue-500 hover:text-blue-700 mr-1">Edit</button>
+                      <button onClick={()=>deleteSchedule(s.id)} className="text-red-400 hover:text-red-600">Del</button>
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* â”€â”€ Stock Tab â”€â”€ */}
+      {tab==='stock'&&(
+        <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 border-b">
+              <tr>
+                {['#','Branch Code','Branch','Stock Value (ر.س)'].map(h=>(
+                  <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-50">
+              {branches.filter(b=>branchFilter==='all'||b.id===branchFilter).map((b,i)=>(
+                <tr key={b.id} className="hover:bg-gray-50">
+                  <td className="px-4 py-3 text-gray-400 text-xs">{i+1}</td>
+                  <td className="px-4 py-3 font-mono text-xs text-blue-600 font-semibold">{b.branchCode||'—'}</td>
+                  <td className="px-4 py-3 font-medium text-gray-800">{b.name}</td>
+                  <td className={`px-4 py-3 font-semibold ${(b.stockValue??0)<0?'text-red-600':'text-gray-800'}`}>
+                    {(b.stockValue??0).toLocaleString('en-US')} ر.س
+                  </td>
+                </tr>
+              ))}
+              {branches.length===0&&<tr><td colSpan={4} className="px-4 py-8 text-center text-gray-400">No branches — add branches first</td></tr>}
+            </tbody>
+            <tfoot className="bg-gray-50 border-t-2">
+              <tr>
+                <td colSpan={3} className="px-4 py-3 text-sm font-bold text-gray-700">Total</td>
+                <td className="px-4 py-3 text-sm font-bold text-gray-900">
+                  {branches.filter(b=>branchFilter==='all'||b.id===branchFilter).reduce((s,b)=>s+(b.stockValue??0),0).toLocaleString('en-US')} ر.س
+                </td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      )}
+
+      {tab==='inv2026'&&(
+        <div className="space-y-4">
+          {!selectedBranch26 ? (
+            /* Branch List */
+             /* Branch List */
+             <div className="space-y-4">
+               <div className="flex items-center justify-between">
+                 <p className="text-sm text-gray-500">{inv2026Items.length>0?"Click branch to view details or add more":"No data — click Add Record to start"}</p>
+                 <div className="flex gap-2">
+                   <button onClick={()=>{if(confirm("Clear ALL inventory 2026 data?")){deleteInv2026ItemsByBranch("ALL");alert("All data cleared")}}} className="px-3 py-2 bg-gray-600 text-white rounded-lg text-sm hover:bg-gray-700">Clear All</button>
+                   <button onClick={()=>setShowAdd26Modal(true)} className="px-4 py-2 bg-red-600 text-white rounded-lg text-sm font-semibold hover:bg-red-700">+ Add Record</button>
+                 </div>
+               </div>
+               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+               {branches.filter(b=>inv2026Items.some((x: {branchId:string})=>x.branchId===b.id)).map(b => {
+                 const items = inv2026Items.filter(x=>x.branchId===b.id)
+                 const totalVariance = items.reduce((s,i)=>s+i.varianceValue,0)
+                 const shortItems = items.filter(i=>i.varianceQty<0).length
+                 const overItems = items.filter(i=>i.varianceQty>0).length
+                      <p className="text-sm font-bold text-white">{b.name}</p>
+                      <p className="text-xs text-red-200">{b.area}</p>
+                    </div>
+                    <div className="px-4 py-3 space-y-2">
+                      <div className="flex justify-between items-center">
+                        <span className="text-xs text-gray-400">Variance Value</span>
+                        <span className={`text-sm font-bold ${totalVariance<0?'text-red-600':totalVariance>0?'text-green-700':'text-gray-400'}`}>
+                          {totalVariance!==0?totalVariance.toLocaleString('en-US')+' ر.س':'—'}
+                        </span>
+                      </div>
+                      <div className="flex gap-3 text-xs">
+                        <span className="text-red-500">Short: {shortItems}</span>
+                        <span className="text-green-600">Over: {overItems}</span>
+                        <span className="text-gray-400">Items: {items.length}</span>
+                      </div>
+                    </div>
+                    <div className="px-4 pb-3">
+                      <div className="text-xs text-red-600 font-medium">Click to view details →</div>
+                    </div>
+                  </div>
+                )
+              })}
+               })}
+              </div>
+            </div>
+            /* Branch Detail View */
+            (() => {
+              const branch = branches.find(b=>b.id===selectedBranch26)
+              const items = inv2026Items.filter(x=>x.branchId===selectedBranch26)
+              const totalVarianceQty = items.reduce((s,i)=>s+i.varianceQty,0)
+              const totalVarianceVal = items.reduce((s,i)=>s+i.varianceValue,0)
+              const shortItems = items.filter(i=>i.varianceQty<0)
+              const catMap: Record<string,{count:number,value:number}> = {}
+              shortItems.forEach(i=>{ if(!catMap[i.category]) catMap[i.category]={count:0,value:0}; catMap[i.category].count++; catMap[i.category].value+=i.varianceValue })
+              const topShortCats = Object.entries(catMap).sort((a,b)=>a[1].value-b[1].value).slice(0,5)
+              const handleImport26 = (e: React.ChangeEvent<HTMLInputElement>) => {
+                const file = e.target.files?.[0]; if(!file) return
+                const reader = new FileReader()
+                reader.onload = (ev) => {
+                  const wb = XLSX.read(new Uint8Array(ev.target?.result as ArrayBuffer),{type:'array'})
+                  const ws = wb.Sheets[wb.SheetNames[0]]
+                  const rows = XLSX.utils.sheet_to_json(ws) as Record<string,unknown>[]
+                  const norm = (r: Record<string,unknown>) => { const n: Record<string,unknown>={}; Object.keys(r).forEach(k=>{n[k.trim()]=r[k]}); return n }
+                  const newItems = rows.map(raw => {
+                    const r = norm(raw)
+                    const sQty = Number(r['System Qty']??r['SystemQty']??0)
+                    const pQty = Number(r['Phys. Qty']??r['PhysQty']??r['Physical Qty']??0)
+                    const vQty = pQty - sQty
+                    const cost = Number(r['Cost Price']??r['CostPrice']??r['Unit Cost']??0)
+                    return {
+                      branchId: selectedBranch26!,
+                      cat: String(r['Cat']??r['SKU']??r['Code']??''),
+                      description: String(r['Description']??r['Desc']??''),
+                      category: String(r['Category']??r['Cat']??''),
+                      systemQty: sQty, physQty: pQty, varianceQty: vQty,
+                      costPrice: cost, varianceValue: vQty * cost
+                    }
+                  }).filter(i=>i.cat)
+                  bulkAddInv2026Items(selectedBranch26!, newItems)
+                  alert(`Imported ${newItems.length} items`)
+                }
+                reader.readAsArrayBuffer(file)
+                e.target.value=''
+              }
+              const handleExport26 = () => {
+                exportToExcel(items.map(i=>({'Cat':i.cat,'Description':i.description,'Category':i.category,'System Qty':i.systemQty,'Phys. Qty':i.physQty,'Variance Qty':i.varianceQty,'Cost Price':i.costPrice,'Variance Value':i.varianceValue})), `Inventory2026_${branch?.name??'Branch'}`)
+              }
+              return (
+                <div className="space-y-4">
+                  {/* Header */}
+                  <div className="flex items-center justify-between flex-wrap gap-3">
+                    <div className="flex items-center gap-3">
+                      <button onClick={()=>setSelectedBranch26(null)} className="px-3 py-1.5 text-sm text-red-600 border border-red-200 rounded-lg hover:bg-red-50">← All Branches</button>
+                      <div>
+                        <h2 className="font-bold text-gray-800">{branch?.name}</h2>
+                        <p className="text-xs text-gray-400">{branch?.branchCode} — Inventory Results 2026</p>
+                      </div>
+                    </div>
+                    <div className="flex gap-2">
+                      <button onClick={handleExport26} className="px-3 py-1.5 text-sm bg-green-600 text-white rounded-lg hover:bg-green-700">Export Excel</button>
+                      <input ref={importRef26} type="file" accept=".xlsx,.xls" className="hidden" onChange={handleImport26}/>
+                      <button onClick={()=>importRef26.current?.click()} className="px-3 py-1.5 text-sm bg-yellow-500 text-white rounded-lg hover:bg-yellow-600">Import Excel</button>
+                      <button onClick={()=>{if(confirm('Clear all items for this branch?'))deleteInv2026ItemsByBranch(selectedBranch26!)}} className="px-3 py-1.5 text-sm bg-red-600 text-white rounded-lg hover:bg-red-700">Clear</button>
+                    </div>
+                  </div>
+
+                  {/* Summary KPIs */}
+                  <div className="grid grid-cols-2 xl:grid-cols-4 gap-3">
+                    <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 text-center">
+                      <p className="text-xs text-blue-500 font-semibold uppercase">Total Items</p>
+                      <p className="text-xl font-bold text-blue-700">{items.length.toLocaleString()}</p>
+                    </div>
+                    <div className={`border rounded-xl p-3 text-center ${totalVarianceVal<0?'bg-red-50 border-red-200':'bg-green-50 border-green-200'}`}>
+                      <p className={`text-xs font-semibold uppercase ${totalVarianceVal<0?'text-red-500':'text-green-500'}`}>Total Variance Value</p>
+                      <p className={`text-xl font-bold ${totalVarianceVal<0?'text-red-700':'text-green-700'}`}>{totalVarianceVal.toLocaleString('en-US')} ر.س</p>
+                    </div>
+                    <div className="bg-orange-50 border border-orange-200 rounded-xl p-3 text-center">
+                      <p className="text-xs text-orange-500 font-semibold uppercase">Short Items</p>
+                      <p className="text-xl font-bold text-orange-700">{shortItems.length.toLocaleString()}</p>
+                    </div>
+                    <div className="bg-purple-50 border border-purple-200 rounded-xl p-3 text-center">
+                      <p className="text-xs text-purple-500 font-semibold uppercase">Over Items</p>
+                      <p className="text-xl font-bold text-purple-700">{items.filter(i=>i.varianceQty>0).length.toLocaleString()}</p>
+                    </div>
+                  </div>
+
+                  {/* Top Short Categories */}
+                  {topShortCats.length>0&&(
+                    <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-4">
+                      <h3 className="text-sm font-semibold text-gray-700 mb-3">Top Categories with Shortage</h3>
+                      <div className="space-y-2">
+                        {topShortCats.map(([cat,data])=>(
+                          <div key={cat} className="flex items-center justify-between">
+                            <span className="text-sm text-gray-700">{cat}</span>
+                            <div className="flex gap-4 text-xs">
+                              <span className="text-orange-600">{data.count} items</span>
+                              <span className="text-red-600 font-semibold">{data.value.toLocaleString('en-US')} ر.س</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Items Table */}
+                  <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-auto">
+                    <table className="w-full" style={{fontSize:'11px'}}>
+                      <thead className="bg-gray-50 border-b sticky top-0">
+                        <tr>
+                          {['#','Cat','Description','Category','System Qty','Phys. Qty','Variance Qty','Cost Price','Variance Value'].map(h=>(
+                            <th key={h} className="px-2 py-2 text-left text-xs font-semibold text-gray-500 whitespace-nowrap">{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-100">
+                        {items.length===0&&<tr><td colSpan={9} className="px-4 py-8 text-center text-gray-400">No items — Import from Excel</td></tr>}
+                        {items.map((item,i)=>(
+                          <tr key={item.id} className={`${item.varianceQty<0?'bg-red-50 hover:bg-red-100':item.varianceQty>0?'bg-green-50 hover:bg-green-100':'hover:bg-gray-50'}`}>
+                            <td className="px-2 py-1 text-gray-400">{i+1}</td>
+                            <td className="px-2 py-1 font-mono text-blue-600 font-semibold">{item.cat}</td>
+                            <td className="px-2 py-1 text-gray-800 max-w-[200px] truncate">{item.description}</td>
+                            <td className="px-2 py-1 text-gray-600">{item.category}</td>
+                            <td className="px-2 py-1 text-center">{item.systemQty.toLocaleString()}</td>
+                            <td className="px-2 py-1 text-center">{item.physQty.toLocaleString()}</td>
+                            <td className={`px-2 py-1 text-center font-bold ${item.varianceQty<0?'text-red-600':item.varianceQty>0?'text-green-700':'text-gray-400'}`}>
+                              {item.varianceQty>0?'+':''}{item.varianceQty.toLocaleString()}
+                            </td>
+                            <td className="px-2 py-1 text-center">{item.costPrice.toLocaleString('en-US')}</td>
+                            <td className={`px-2 py-1 text-center font-bold ${item.varianceValue<0?'text-red-700':item.varianceValue>0?'text-green-700':'text-gray-400'}`}>
+                              {item.varianceValue>0?'+':''}{item.varianceValue.toLocaleString('en-US')}
+                            </td>
+                          </tr>
+                        ))}
+                        {items.length>0&&(
+                          <tr className="bg-gray-800 text-white font-bold">
+                            <td colSpan={4} className="px-2 py-2 text-right text-xs">TOTAL</td>
+                            <td className="px-2 py-2 text-center">{items.reduce((s,i)=>s+i.systemQty,0).toLocaleString()}</td>
+                            <td className="px-2 py-2 text-center">{items.reduce((s,i)=>s+i.physQty,0).toLocaleString()}</td>
+                            <td className={`px-2 py-2 text-center ${totalVarianceQty<0?'text-red-300':totalVarianceQty>0?'text-green-300':''}`}>
+                              {totalVarianceQty>0?'+':''}{totalVarianceQty.toLocaleString()}
+                            </td>
+                            <td className="px-2 py-2"></td>
+                            <td className={`px-2 py-2 text-center ${totalVarianceVal<0?'text-red-300':totalVarianceVal>0?'text-green-300':''}`}>
+                              {totalVarianceVal>0?'+':''}{totalVarianceVal.toLocaleString('en-US')} ر.س
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )
+            })()
+          )}
+        </div>
+      )}
+
+      {/* â”€â”€ Inventory Schedule Tab â”€â”€ */}
+
+
+      {/* â”€â”€ Stock Tab â”€â”€ */}
+      {tab==='stock'&&(
+        <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 border-b">
+              <tr>
+                {['#','Branch Code','Branch','Stock Value (ر.س)'].map(h=>(
+                  <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-50">
+              {branches.filter(b=>branchFilter==='all'||b.id===branchFilter).map((b,i)=>(
+                <tr key={b.id} className="hover:bg-gray-50">
+                  <td className="px-4 py-3 text-gray-400 text-xs">{i+1}</td>
+                  <td className="px-4 py-3 font-mono text-xs text-blue-600 font-semibold">{b.branchCode||'—'}</td>
+                  <td className="px-4 py-3 font-medium text-gray-800">{b.name}</td>
+                  <td className={`px-4 py-3 font-semibold ${(b.stockValue??0)<0?'text-red-600':'text-gray-800'}`}>
+                    {(b.stockValue??0).toLocaleString('en-US')} ر.س
+                  </td>
+                </tr>
+              ))}
+              {branches.length===0&&<tr><td colSpan={4} className="px-4 py-8 text-center text-gray-400">No branches — add branches first</td></tr>}
+            </tbody>
+            <tfoot className="bg-gray-50 border-t-2">
+              <tr>
+                <td colSpan={3} className="px-4 py-3 text-sm font-bold text-gray-700">Total</td>
+                <td className="px-4 py-3 text-sm font-bold text-gray-900">
+                  {branches.filter(b=>branchFilter==='all'||b.id===branchFilter).reduce((s,b)=>s+(b.stockValue??0),0).toLocaleString('en-US')} ر.س
+                </td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      )}
+
+
+      {tab==='stock'&&(
+        <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 border-b">
+              <tr>{['Branch Code','Branch','Results (Ø±ÙŠØ§Ù„)'].map(h=><th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">{h}</th>)}</tr>
+            </thead>
+            <tbody className="divide-y divide-gray-50">
+              {branches.filter(b=>branchFilter==='all'||b.id===branchFilter).map(b=>{
+                const val = b.inventoryValue ?? 0
+                return(
+                  <tr key={b.id} className="hover:bg-gray-50">
+                    <td className="px-4 py-3 font-mono text-xs text-blue-600 font-semibold">{b.branchClass}</td>
+                    <td className="px-4 py-3 font-medium text-gray-800">{b.name}</td>
+                    <td className="px-4 py-3 font-semibold text-gray-800">{val.toLocaleString()} Ø±ÙŠØ§Ù„</td>
+                  </tr>
+                )
+              })}
+              {(()=>{
+                const total=branches.filter(b=>branchFilter==='all'||b.id===branchFilter).reduce((sum,b)=>sum+(b.inventoryValue??0),0)
+                return <tr className="bg-gray-50 border-t-2 border-gray-300 font-bold"><td className="px-4 py-3 text-xs text-gray-500 uppercase" colSpan={2}>Total</td><td className="px-4 py-3 text-gray-900">{total.toLocaleString()} Ø±ÙŠØ§Ù„</td></tr>
+              })()}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* â”€â”€ Transfer Modal â”€â”€ */}
+      {showTransfer&&(
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6 space-y-4">
+            <h2 className="text-lg font-bold">Transfer Stock</h2>
+            <div><label className="text-xs font-medium text-gray-600">Product</label>
+              <select className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={tf.productId} onChange={e=>setTf({...tf,productId:e.target.value})}>
+                <option value="">Select product</option>{products.map(p=><option key={p.id} value={p.id}>{p.description}</option>)}
+              </select>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div><label className="text-xs font-medium text-gray-600">From Branch</label>
+                <select className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={tf.fromBranchId} onChange={e=>setTf({...tf,fromBranchId:e.target.value})}>
+                  <option value="">Select</option>{branches.map(b=><option key={b.id} value={b.id}>{b.name} ({getQty(b.id,tf.productId)})</option>)}
+                </select>
+              </div>
+              <div><label className="text-xs font-medium text-gray-600">To Branch</label>
+                <select className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={tf.toBranchId} onChange={e=>setTf({...tf,toBranchId:e.target.value})}>
+                  <option value="">Select</option>{branches.filter(b=>b.id!==tf.fromBranchId).map(b=><option key={b.id} value={b.id}>{b.name}</option>)}
+                </select>
+              </div>
+            </div>
+            <div><label className="text-xs font-medium text-gray-600">Quantity</label><input type="number" min={1} className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={tf.quantity} onChange={e=>setTf({...tf,quantity:+e.target.value})}/></div>
+            <div><label className="text-xs font-medium text-gray-600">Notes</label><input className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={tf.note} onChange={e=>setTf({...tf,note:e.target.value})}/></div>
+            <div className="flex gap-3 pt-2">
+              <button onClick={()=>setShowTransfer(false)} className="flex-1 border rounded-lg py-2 text-sm">Cancel</button>
+              <button onClick={doTransfer} className="flex-1 bg-blue-600 text-white rounded-lg py-2 text-sm font-medium">Transfer</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* â”€â”€ Schedule Add/Edit Modal â”€â”€ */}
+      {showModal&&(
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-2xl p-6 space-y-4 max-h-[90vh] overflow-y-auto">
+            <h2 className="text-lg font-bold">{editRec?'Edit Record':'Add Inventory Schedule'}</h2>
+            <div className="grid grid-cols-2 gap-4">
+              <div className="col-span-2"><label className="text-xs font-medium text-gray-600">Inventory Type</label>
+                <select className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form.inventoryType} onChange={e=>setForm({...form,inventoryType:e.target.value as InventoryType})}>
+                  {INVENTORY_TYPES.map(t=><option key={t} value={t}>{t}</option>)}
+                </select>
+              </div>
+              <div><label className="text-xs font-medium text-gray-600">From</label><input type="date" className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form.from} onChange={e=>setForm({...form,from:e.target.value})}/>{form.from&&<p className="text-xs text-gray-400 mt-1">{getDayName(form.from)}</p>}</div>
+              <div><label className="text-xs font-medium text-gray-600">To</label><input type="date" className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form.to} onChange={e=>setForm({...form,to:e.target.value})}/>{form.to&&<p className="text-xs text-gray-400 mt-1">{getDayName(form.to)} Â· {getDaysDiff(form.from,form.to)} days</p>}</div>
+              <div><label className="text-xs font-medium text-gray-600">Branch</label>
+                <select className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form.branchId} onChange={e=>setForm({...form,branchId:e.target.value})}>
+                  <option value="">Select branch</option>{branches.map(b=><option key={b.id} value={b.id}>{b.name}</option>)}
+                </select>
+              </div>
+              <div><label className="text-xs font-medium text-gray-600">Region</label><input className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form.region} onChange={e=>setForm({...form,region:e.target.value})}/></div>
+              <div><label className="text-xs font-medium text-gray-600">Team</label><input className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form.team} onChange={e=>setForm({...form,team:e.target.value})}/></div>
+              <div><label className="text-xs font-medium text-gray-600">IN / OUT</label>
+                <select className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form.inOut} onChange={e=>setForm({...form,inOut:e.target.value as 'IN'|'OUT'})}>
+                  <option value="IN">IN</option><option value="OUT">OUT</option>
+                </select>
+              </div>
+              <div><label className="text-xs font-medium text-gray-600">Results</label><input type="number" className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form.results} onChange={e=>setForm({...form,results:+e.target.value})}/></div>
+              <div><label className="text-xs font-medium text-gray-600">Total Sales 2026</label><input type="number" className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form.totalSales2026} onChange={e=>setForm({...form,totalSales2026:+e.target.value})}/></div>
+              <div><label className="text-xs font-medium text-gray-600">Last Inventory Result</label><input type="number" className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form.lastInventoryResult} onChange={e=>setForm({...form,lastInventoryResult:+e.target.value})}/></div>
+              <div><label className="text-xs font-medium text-gray-600">Last Inventory Date</label><input type="date" className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form.lastInventory} onChange={e=>setForm({...form,lastInventory:e.target.value})}/></div>
+              <div><label className="text-xs font-medium text-gray-600">Team Leader</label><input className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form.teamLeader} onChange={e=>setForm({...form,teamLeader:e.target.value})}/></div>
+              <div className="col-span-2"><label className="text-xs font-medium text-gray-600">Notes</label><textarea className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" rows={2} value={form.notes} onChange={e=>setForm({...form,notes:e.target.value})}/></div>
+            </div>
+            <div className="flex gap-3 pt-2">
+              <button onClick={()=>setShowModal(false)} className="flex-1 border rounded-lg py-2 text-sm">Cancel</button>
+              <button onClick={save} className="flex-1 bg-red-700 text-white rounded-lg py-2 text-sm font-medium">Save</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* â”€â”€ Inv2025 Add/Edit Modal â”€â”€ */}
+      {showI25Modal&&(
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg p-6 space-y-4 max-h-[90vh] overflow-y-auto">
+            <h2 className="text-lg font-bold">{editI25?'Edit Record':'Add Inventory 2025'}</h2>
+            <div className="grid grid-cols-2 gap-4">
+              <div className="col-span-2"><label className="text-xs font-medium text-gray-600">Inventory Type</label>
+                <select className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form25.inventoryType} onChange={e=>setForm25({...form25,inventoryType:e.target.value as InventoryType})}>
+                  {INVENTORY_TYPES.map(t=><option key={t} value={t}>{t}</option>)}
+                </select>
+              </div>
+              <div><label className="text-xs font-medium text-gray-600">Date</label><input type="date" className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form25.date} onChange={e=>setForm25({...form25,date:e.target.value})}/>{form25.date&&<p className="text-xs text-gray-400 mt-1">{getDayName(form25.date)}</p>}</div>
+              <div><label className="text-xs font-medium text-gray-600">Area</label><input className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form25.area} onChange={e=>setForm25({...form25,area:e.target.value})}/></div>
+              <div><label className="text-xs font-medium text-gray-600">Branch</label>
+                <select className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form25.branchId} onChange={e=>{const b=branches.find(x=>x.id===e.target.value);setForm25({...form25,branchId:e.target.value,branchCode:b?.branchCode??b?.branchClass??'',area:form25.area||b?.area||''})}}>
+                  <option value="">Select branch</option>{branches.map(b=><option key={b.id} value={b.id}>{b.name}</option>)}
+                </select>
+              </div>
+              <div><label className="text-xs font-medium text-gray-600">Branch Code</label><input className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form25.branchCode} onChange={e=>setForm25({...form25,branchCode:e.target.value})}/></div>
+              <div><label className="text-xs font-medium text-gray-600">Results</label><input type="number" className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form25.results} onChange={e=>setForm25({...form25,results:+e.target.value})}/></div>
+              <div><label className="text-xs font-medium text-gray-600">Sales</label><input type="number" className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value={form25.sales} onChange={e=>setForm25({...form25,sales:+e.target.value})}/>{form25.sales>0&&<p className="text-xs text-gray-400 mt-1">% = {((form25.results/form25.sales)*100).toFixed(1)}%</p>}</div>
+              <div className="col-span-2"><label className="text-xs font-medium text-gray-600">Notes</label><textarea className="mt-1 w-full border rounded-lg px-3 py-2 text-sm" rows={2} value={form25.notes} onChange={e=>setForm25({...form25,notes:e.target.value})}/></div>
+            </div>
+            <div className="flex gap-3 pt-2">
+              <button onClick={()=>setShowI25Modal(false)} className="flex-1 border rounded-lg py-2 text-sm">Cancel</button>
+              <button onClick={saveI25} className="flex-1 bg-red-700 text-white rounded-lg py-2 text-sm font-medium">Save</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {tab === 'analysis' && (
+        <div className="space-y-6">
+          {/* Summary Cards */}
+          <div className="grid grid-cols-4 gap-4">
+            <div className="bg-white rounded-xl border p-4 shadow-sm">
+              <p className="text-xs text-gray-500 uppercase font-semibold">Total Branches</p>
+              <p className="text-2xl font-bold text-gray-800 mt-1">{analysisData.length}</p>
+            </div>
+            <div className="bg-white rounded-xl border p-4 shadow-sm">
+              <p className="text-xs text-gray-500 uppercase font-semibold">Total Results</p>
+              <p className={`text-2xl font-bold mt-1 ${analysisData.reduce((a, r) => a + r.results, 0) < 0 ? 'text-red-600' : 'text-green-600'}`}>
+                {analysisData.reduce((a, r) => a + r.results, 0).toLocaleString('en-US')}
+              </p>
+            </div>
+            <div className="bg-white rounded-xl border p-4 shadow-sm">
+              <p className="text-xs text-gray-500 uppercase font-semibold">Total Sales 2026</p>
+              <p className="text-2xl font-bold text-blue-700 mt-1">{analysisData.reduce((a, r) => a + (r.totalSales ?? 0), 0).toLocaleString('en-US')}</p>
+            </div>
+            <div className="bg-white rounded-xl border p-4 shadow-sm">
+              <p className="text-xs text-gray-500 uppercase font-semibold">Avg Percentage</p>
+              {(() => {
+                const valid = analysisData.filter(r => r.pct !== null)
+                const avg = valid.length ? valid.reduce((a, r) => a + (r.pct ?? 0), 0) / valid.length : 0
+                return <p className={`text-2xl font-bold mt-1 ${avg < 0 ? 'text-red-600' : 'text-green-600'}`}>{avg.toFixed(2)}%</p>
+              })()}
+            </div>
+          </div>
+
+          {/* Charts */}
+          <div className="grid xl:grid-cols-2 gap-6">
+            <div className="bg-white rounded-xl border shadow-sm p-5">
+              <h2 className="text-sm font-semibold text-gray-700 mb-4">Results by Branch</h2>
+              <ResponsiveContainer width="100%" height={300}>
+                <BarChart data={analysisData.slice(0, 15).map(r => ({ name: r.branch.length > 15 ? r.branch.slice(0, 15) + '...' : r.branch, results: r.results }))} layout="vertical" margin={{ left: 10, right: 40 }}>
+                  <XAxis type="number" tick={{ fontSize: 9 }} tickFormatter={v => `${(Number(v) / 1000).toFixed(0)}k`} />
+                  <YAxis type="category" dataKey="name" tick={{ fontSize: 9 }} width={120} />
+                  <ReferenceLine x={0} stroke="#666" strokeWidth={1} />
+                  <Tooltip formatter={v => `${Number(v).toLocaleString('en-US')} ر.س`} />
+                  <Bar dataKey="results" radius={[0, 4, 4, 0]} name="Results">
+                    {analysisData.slice(0, 15).map((r, i) => <Cell key={i} fill={r.results >= 0 ? '#10b981' : '#ef4444'} />)}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+
+            <div className="bg-white rounded-xl border shadow-sm p-5">
+              <h2 className="text-sm font-semibold text-gray-700 mb-1">Current % vs Last Inventory %</h2>
+              <p className="text-xs text-gray-400 mb-3">Result as % of Total Sales</p>
+              <ResponsiveContainer width="100%" height={300}>
+                <BarChart data={analysisData.filter(r => r.pct !== null).slice(0, 15).map(r => ({ name: r.branch.length > 15 ? r.branch.slice(0, 15) + '...' : r.branch, 'Current %': r.pct ?? 0, 'Last %': r.lastPct ?? 0 }))} layout="vertical" margin={{ left: 10, right: 40 }}>
+                  <XAxis type="number" tick={{ fontSize: 9 }} tickFormatter={v => `${Number(v).toFixed(1)}%`} />
+                  <YAxis type="category" dataKey="name" tick={{ fontSize: 9 }} width={120} />
+                  <ReferenceLine x={0} stroke="#666" strokeWidth={1} />
+                  <Tooltip formatter={v => `${Number(v).toFixed(2)}%`} />
+                  <Bar dataKey="Current %" fill="#3b82f6" radius={[0, 4, 4, 0]} />
+                  <Bar dataKey="Last %" fill="#d1d5db" radius={[0, 4, 4, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
+          {/* Full Analysis Table */}
+          <div className="bg-white rounded-xl border shadow-sm overflow-x-auto">
+            <div className="px-4 py-3 border-b flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-gray-700">Branch Analysis Detail</h2>
+              <span className="text-xs text-gray-400">{analysisData.length} records</span>
+            </div>
+            <table className="w-full" style={{ fontSize: '11px' }}>
+              <thead className="bg-gray-50 border-b">
+                <tr>
+                  {['Branch', 'Region', 'From', 'To', 'Days', 'Last Inventory', 'Gap (days)', 'Results', 'Total Sales', '%', 'Last Results', 'Last %', 'Change'].map(h => (
+                    <th key={h} className="px-2 py-2 text-left text-xs font-semibold text-gray-500 whitespace-nowrap">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {analysisData.map((r, i) => {
+                  const change = (r.pct !== null && r.lastPct !== null) ? (r.pct - r.lastPct) : null
+                  return (
+                    <tr key={r.id} className={`hover:bg-gray-50 ${i % 2 === 0 ? '' : 'bg-gray-50/30'}`}>
+                      <td className="px-2 py-1.5 font-semibold whitespace-nowrap">{r.branch}</td>
+                      <td className="px-2 py-1.5 text-gray-500">{r.region}</td>
+                      <td className="px-2 py-1.5 whitespace-nowrap">{r.from}</td>
+                      <td className="px-2 py-1.5 whitespace-nowrap">{r.to}</td>
+                      <td className="px-2 py-1.5 text-center font-semibold">{r.days}</td>
+                      <td className="px-2 py-1.5 whitespace-nowrap text-gray-500">{r.lastInventory || '—'}</td>
+                      <td className="px-2 py-1.5 text-center">{r.daysSinceLast ?? '—'}</td>
+                      <td className={`px-2 py-1.5 text-right font-bold ${r.results < 0 ? 'text-red-600' : 'text-green-700'}`}>{r.results.toLocaleString('en-US')}</td>
+                      <td className="px-2 py-1.5 text-right text-gray-600">{r.totalSales ? r.totalSales.toLocaleString('en-US') : '—'}</td>
+                      <td className={`px-2 py-1.5 text-right font-semibold ${(r.pct ?? 0) < 0 ? 'text-red-600' : 'text-green-600'}`}>{r.pct !== null ? r.pct.toFixed(2) + '%' : '—'}</td>
+                      <td className={`px-2 py-1.5 text-right ${(r.lastResults ?? 0) < 0 ? 'text-red-400' : 'text-gray-500'}`}>{r.lastResults ? r.lastResults.toLocaleString('en-US') : '—'}</td>
+                      <td className={`px-2 py-1.5 text-right ${(r.lastPct ?? 0) < 0 ? 'text-red-400' : 'text-gray-500'}`}>{r.lastPct !== null ? r.lastPct.toFixed(2) + '%' : '—'}</td>
+                      <td className={`px-2 py-1.5 text-right font-semibold ${change === null ? 'text-gray-400' : change > 0 ? 'text-green-600' : 'text-red-600'}`}>{change !== null ? (change > 0 ? '+' : '') + change.toFixed(2) + '%' : '—'}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+
+
+      {/* Add Record 2026 Modal */}
+      {showAdd26Modal&&(
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg">
+            <div className="px-6 py-4 border-b flex items-center justify-between">
+              <h2 className="text-lg font-bold text-gray-800">Add Inventory Record 2026</h2>
+              <button onClick={()=>setShowAdd26Modal(false)} className="text-gray-400 hover:text-gray-600 text-xl font-bold">×</button>
+            </div>
+            <div className="px-6 py-5 space-y-4">
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="text-xs font-semibold text-gray-600 block mb-1">Inventory Type</label>
+                  <select className="w-full border rounded-lg px-3 py-2 text-sm" value={add26Form.inventoryType} onChange={e=>setAdd26Form({...add26Form,inventoryType:e.target.value as InventoryType})}>
+                    {INVENTORY_TYPES.map(t=><option key={t} value={t}>{t}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs font-semibold text-gray-600 block mb-1">Date</label>
+                  <input type="date" className="w-full border rounded-lg px-3 py-2 text-sm" value={add26Form.date} onChange={e=>setAdd26Form({...add26Form,date:e.target.value})}/>
+                </div>
+              </div>
+              <div>
+                <label className="text-xs font-semibold text-gray-600 block mb-1">Area</label>
+                <input type="text" className="w-full border rounded-lg px-3 py-2 text-sm" value={add26Form.area} onChange={e=>setAdd26Form({...add26Form,area:e.target.value})} placeholder="Area name"/>
+              </div>
+              <div>
+                <label className="text-xs font-semibold text-gray-600 block mb-1">Branch</label>
+                <select className="w-full border rounded-lg px-3 py-2 text-sm" value={add26Form.branchId} onChange={e=>setAdd26Form({...add26Form,branchId:e.target.value})}>
+                  <option value="">Select Branch</option>
+                  {branches.map(b=><option key={b.id} value={b.id}>{b.branchCode?b.branchCode+' - ':''}{b.name}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="text-xs font-semibold text-gray-600 block mb-1">Notes</label>
+                <textarea className="w-full border rounded-lg px-3 py-2 text-sm" value={add26Form.notes} onChange={e=>setAdd26Form({...add26Form,notes:e.target.value})} placeholder="Optional notes..." rows={2}/>
+              </div>
+              <div>
+                <label className="text-xs font-semibold text-gray-600 block mb-1">Excel File (Cat, Description, Category, System Qty, Phys. Qty, Variance Qty, Variance - VALUE)</label>
+                <input ref={add26FileRef} type="file" accept=".xlsx,.xls" className="hidden" onChange={(e)=>setAdd26Form({...add26Form,file:e.target.files?.[0]||null})}/>
+                <div className="flex items-center gap-2">
+                  <button onClick={()=>add26FileRef.current?.click()} className="px-3 py-2 bg-blue-100 text-blue-700 rounded-lg text-sm hover:bg-blue-200">{add26Form.file?add26Form.file.name:'Choose File'}</button>
+                  {add26Form.file&&<span className="text-xs text-green-600">✓ File selected</span>}
+                </div>
+              </div>
+              <button
+                onClick={()=>{
+                  if(!add26Form.branchId||!add26Form.date||!add26Form.file){alert('Please fill all required fields and select file');return}
+                  const reader=new FileReader()
+                  reader.onload=(ev)=>{
+                    const wb=XLSX.read(new Uint8Array(ev.target?.result as ArrayBuffer),{type:'array'})
+                    const rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]) as Record<string,unknown>[]
+                    const norm=(r: Record<string,unknown>)=>{const n: Record<string,unknown>={};Object.keys(r).forEach(k=>{n[k.trim()]=r[k]});return n}
+                    const newItems=rows.map(raw=>{const r=norm(raw);const sQty=Number(r['System Qty']??0);const pQty=Number(r['Phys. Qty']??r['Phys Qty']??0);const vQty=Number(r['Variance Qty']??(pQty-sQty));const vVal=Number(r['Variance - VALUE']??r['Variance Value']??0);const cost=vQty!==0&&vVal!==0?Math.abs(vVal/vQty):0;return {branchId:add26Form.branchId,cat:String(r['Cat']??''),description:String(r['Description']??''),category:String(r['Category']??''),systemQty:sQty,physQty:pQty,varianceQty:vQty,costPrice:cost,varianceValue:vVal}}).filter((i: {cat:string})=>i.cat)
+                    bulkAddInv2026Items(add26Form.branchId,newItems)
+                    alert(Imported  items for )
+                    setShowAdd26Modal(false);setAdd26Form({inventoryType:'Full Count',date:'',area:'',branchId:'',notes:'',file:null})
+                  }
+                  reader.readAsArrayBuffer(add26Form.file)
+                }}
+                className="w-full py-2.5 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700">
+                Save & Import
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
